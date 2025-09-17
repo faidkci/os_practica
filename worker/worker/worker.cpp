@@ -1,6 +1,6 @@
-﻿#include <iostream>
+#include <iostream>
 #include <cctype>
-#include <cstring>
+#include <string>
 #include <windows.h>
 #include <process.h>
 
@@ -22,7 +22,6 @@ DWORD WINAPI workerThread(LPVOID param) {
 
     // Извлекаем знаки препинания и разделители
     for (size_t i = 0; i < len; i++) {
-        // Используем ispunct для знаков препинания
         if (ispunct(static_cast<unsigned char>(str[i]))) {
             temp[index++] = str[i];
         }
@@ -43,10 +42,10 @@ unsigned __stdcall workerThreadEx(void* param) {
 }
 
 int main() {
-    // Ввод строки
-    char input[256];
+    // Ввод строки любой длины
+    string input;
     cout << "Enter a string: ";
-    cin.getline(input, sizeof(input));
+    getline(cin, input);
 
     // Ввод задержки
     int sleepTime;
@@ -55,17 +54,17 @@ int main() {
 
     // Подготовка данных для потока
     ThreadData data;
-    data.inputString = input;
+    data.inputString = input.c_str(); // передаём указатель на данные строки
     data.result = nullptr;
 
-    // Создание потока в приостановленном состоянии (вариант с CreateThread)
+    // Создание потока в приостановленном состоянии
     HANDLE hThread = CreateThread(
-        NULL,                   // Атрибуты безопасности по умолчанию
-        0,                      // Размер стека по умолчанию
-        workerThread,           // Функция потока
-        &data,                  // Параметры потока
-        CREATE_SUSPENDED,       // Поток создается приостановленным
-        NULL                    // Идентификатор потока не возвращается
+        NULL,
+        0,
+        workerThread,
+        &data,
+        CREATE_SUSPENDED,
+        NULL
     );
 
     if (hThread == NULL) {
@@ -99,8 +98,7 @@ int main() {
     if (data.result != nullptr && strlen(data.result) > 0) {
         cout << "Punctuation and separator characters: " << data.result << endl;
         delete[] data.result;
-    }
-    else {
+    } else {
         cout << "No punctuation or separator characters found." << endl;
     }
 
