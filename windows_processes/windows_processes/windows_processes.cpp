@@ -1,10 +1,72 @@
+#define NOMINMAX
 #include <windows.h>
 #include <iostream>
 #include <vector>
 #include <string>
 #include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <limits>
 
 using namespace std;
+
+// Исключение для ошибок процессов
+class ProcessException : public runtime_error {
+    DWORD errorCode;
+public:
+    ProcessException(const string& msg, DWORD err)
+        : runtime_error(msg + ", error: " + to_string(err) + " - " + GetSystemErrorString(err)),
+        errorCode(err) {
+    }
+
+    DWORD getErrorCode() const { return errorCode; }
+
+private:
+    static string GetSystemErrorString(DWORD errorCode) {
+        LPSTR messageBuffer = nullptr;
+        DWORD size = FormatMessageA(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            nullptr, errorCode, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPSTR)&messageBuffer, 0, nullptr);
+
+        string message;
+        if (size > 0 && messageBuffer) {
+            message = string(messageBuffer, size);
+            // Убираем символы новой строки в конце
+            while (!message.empty() && (message.back() == '\r' || message.back() == '\n')) {
+                message.pop_back();
+            }
+            LocalFree(messageBuffer);
+        }
+        else {
+            message = "Unknown system error";
+        }
+        return message;
+    }
+};
+
+// Вспомогательная функция для проверки операций
+void CheckPipeOperation(bool success, const string& operationName) {
+    if (!success) {
+        throw ProcessException(operationName, GetLastError());
+    }
+}
+
+// Шаблонная функция для проверки любых операций
+template<typename T>
+void CheckOperation(bool success, const string& operationName, T errorCode) {
+    if (!success) {
+        throw ProcessException(operationName, static_cast<DWORD>(errorCode));
+    }
+}
+
+// Специализация для BOOL операций Windows
+template<>
+void CheckOperation(bool success, const string& operationName, BOOL) {
+    if (!success) {
+        throw ProcessException(operationName, GetLastError());
+    }
+}
 
 // RAII-обертка для дескрипторов Windows
 class HandleGuard {
@@ -51,7 +113,6 @@ public:
         return temp;
     }
 
-    // Оператор приведения к HANDLE для удобства
     operator HANDLE() const { return handle_; }
 
 private:
@@ -63,14 +124,11 @@ class Pipe {
 public:
     Pipe() = default;
 
-    bool create(SECURITY_ATTRIBUTES* sa = nullptr, DWORD size = 0) {
+    void create(SECURITY_ATTRIBUTES* sa = nullptr, DWORD size = 0) {
         HANDLE readEnd, writeEnd;
-        if (!CreatePipe(&readEnd, &writeEnd, sa, size)) {
-            return false;
-        }
+        CheckPipeOperation(CreatePipe(&readEnd, &writeEnd, sa, size), "CreatePipe");
         readEnd_.reset(readEnd);
         writeEnd_.reset(writeEnd);
-        return readEnd_.isValid() && writeEnd_.isValid();
     }
 
     HandleGuard& getReadEnd() { return readEnd_; }
@@ -84,14 +142,44 @@ private:
     HandleGuard writeEnd_;
 };
 
+// Функции для безопасного чтения/записи данных с исключениями
+namespace SafeIO {
+    void readExact(HANDLE handle, void* buffer, DWORD size, const string& context) {
+        BYTE* bytes = static_cast<BYTE*>(buffer);
+        DWORD totalRead = 0;
+
+        while (totalRead < size) {
+            DWORD bytesRead = 0;
+            CheckOperation(ReadFile(handle, bytes + totalRead, size - totalRead, &bytesRead, nullptr),
+                context + " - ReadFile", TRUE);
+
+            if (bytesRead == 0) {
+                throw runtime_error(context + " - Unexpected end of file");
+            }
+
+            totalRead += bytesRead;
+        }
+    }
+
+    void writeExact(HANDLE handle, const void* buffer, DWORD size, const string& context) {
+        const BYTE* bytes = static_cast<const BYTE*>(buffer);
+        DWORD totalWritten = 0;
+
+        while (totalWritten < size) {
+            DWORD bytesWritten = 0;
+            CheckOperation(WriteFile(handle, bytes + totalWritten, size - totalWritten, &bytesWritten, nullptr),
+                context + " - WriteFile", TRUE);
+            totalWritten += bytesWritten;
+        }
+    }
+}
+
 // RAII-обертка для процесса
 class Process {
 public:
     Process() = default;
 
-    ~Process() {
-        // Деструктор автоматически закроет handle'ы
-    }
+    ~Process() = default;
 
     // Запрещаем копирование
     Process(const Process&) = delete;
@@ -101,32 +189,60 @@ public:
     Process(Process&&) = default;
     Process& operator=(Process&&) = default;
 
-    bool create(LPCSTR application, LPSTR commandLine, STARTUPINFOA& si) {
+    void create(LPCSTR application, LPSTR commandLine, STARTUPINFOA& si) {
         PROCESS_INFORMATION pi = {};
-        if (!CreateProcessA(application, commandLine, nullptr, nullptr, TRUE, 0,
-            nullptr, nullptr, &si, &pi)) {
-            return false;
+
+        // Создаем копию командной строки, так как CreateProcess может модифицировать ее
+        unique_ptr<char[]> cmdLineCopy;
+        if (commandLine) {
+            size_t len = strlen(commandLine) + 1;
+            cmdLineCopy = make_unique<char[]>(len);
+            strcpy_s(cmdLineCopy.get(), len, commandLine);
         }
+
+        CheckOperation(CreateProcessA(
+            application,
+            cmdLineCopy ? cmdLineCopy.get() : nullptr,
+            nullptr, nullptr,
+            TRUE,
+            CREATE_NO_WINDOW,
+            nullptr, nullptr,
+            &si,
+            &pi
+        ), "CreateProcess", TRUE);
 
         process_.reset(pi.hProcess);
         thread_.reset(pi.hThread);
-        return true;
     }
 
     HANDLE getProcessHandle() const { return process_.get(); }
-    bool isRunning() const { return process_.isValid(); }
+    bool isRunning() const {
+        if (!process_.isValid()) return false;
 
-    DWORD wait(DWORD timeout = INFINITE) const {
-        return WaitForSingleObject(process_.get(), timeout);
+        DWORD exitCode;
+        if (!GetExitCodeProcess(process_.get(), &exitCode)) {
+            return false;
+        }
+        return exitCode == STILL_ACTIVE;
     }
 
-    bool getExitCode(DWORD& exitCode) const {
-        return GetExitCodeProcess(process_.get(), &exitCode);
+    DWORD wait(DWORD timeout = INFINITE) const {
+        DWORD result = WaitForSingleObject(process_.get(), timeout);
+        if (result == WAIT_FAILED) {
+            throw ProcessException("WaitForSingleObject", GetLastError());
+        }
+        return result;
+    }
+
+    DWORD getExitCode() const {
+        DWORD exitCode;
+        CheckOperation(GetExitCodeProcess(process_.get(), &exitCode), "GetExitCodeProcess", TRUE);
+        return exitCode;
     }
 
     void terminate(UINT exitCode = 1) {
         if (isRunning()) {
-            TerminateProcess(process_.get(), exitCode);
+            CheckOperation(TerminateProcess(process_.get(), exitCode), "TerminateProcess", TRUE);
         }
     }
 
@@ -135,69 +251,107 @@ private:
     HandleGuard thread_;
 };
 
-// Функция для работы в режиме потомка с RAII
+// Функция для очистки буфера ввода
+void ClearInputBuffer() {
+    cin.clear();
+    cin.ignore(numeric_limits<streamsize>::max(), '\n');
+}
+
+// Функция для безопасного ввода числа
+int SafeInputInt(const string& prompt) {
+    int value;
+    while (true) {
+        cout << prompt;
+        if (!(cin >> value)) {
+            cout << "Invalid input. Please enter a valid integer.\n";
+            ClearInputBuffer();
+        }
+        else {
+            ClearInputBuffer();
+            break;
+        }
+    }
+    return value;
+}
+
+// Функция для ввода массива с проверкой лишних элементов
+vector<int> InputArrayWithValidation(int size) {
+    vector<int> array;
+    array.reserve(size);
+
+    cout << "Enter " << size << " elements:\n";
+
+    for (int i = 0; i < size; ++i) {
+        string prompt = "Element " + to_string(i + 1) + ": ";
+        int element = SafeInputInt(prompt);
+        array.push_back(element);
+    }
+
+    // Проверка на лишние элементы
+    cout << "Checking for extra input... ";
+    string extra;
+    if (getline(cin, extra)) {
+        if (!extra.empty()) {
+            throw runtime_error("Too many elements provided. Expected " +
+                to_string(size) + " elements.");
+        }
+    }
+
+    return array;
+}
+
+// Функция для работы в режиме потомка
 void ChildMode() {
     HandleGuard hStdIn(GetStdHandle(STD_INPUT_HANDLE));
     HandleGuard hStdOut(GetStdHandle(STD_OUTPUT_HANDLE));
 
-    int size;
-    DWORD bytesRead;
+    if (!hStdIn.isValid() || !hStdOut.isValid()) {
+        throw runtime_error("Invalid standard handles in child process");
+    }
 
     // Чтение размера массива из stdin
-    if (!ReadFile(hStdIn.get(), &size, sizeof(size), &bytesRead, nullptr) ||
-        bytesRead != sizeof(size)) {
-        cerr << "Child: Failed to read array size" << endl;
+    int size;
+    SafeIO::readExact(hStdIn.get(), &size, sizeof(size), "reading array size");
+
+    // Проверка корректности размера
+    if (size < 0) {
+        throw invalid_argument("Invalid array size: " + to_string(size));
+    }
+
+    if (size == 0) {
+        // Пустой массив - отправляем специальное значение
+        int result = -1;
+        SafeIO::writeExact(hStdOut.get(), &result, sizeof(result), "writing empty array result");
         return;
     }
 
-    vector<int> array(size);
     // Чтение элементов массива
+    vector<int> array(size);
     for (int i = 0; i < size; ++i) {
-        if (!ReadFile(hStdIn.get(), &array[i], sizeof(array[i]), &bytesRead, nullptr) ||
-            bytesRead != sizeof(array[i])) {
-            cerr << "Child: Failed to read array element" << endl;
-            return;
-        }
+        SafeIO::readExact(hStdIn.get(), &array[i], sizeof(array[i]),
+            "reading array element " + to_string(i));
     }
 
     // Поиск максимального элемента
-    if (array.empty()) {
-        // Отправляем специальное значение для пустого массива
-        int errorResult = -1;
-        DWORD bytesWritten;
-        WriteFile(hStdOut.get(), &errorResult, sizeof(errorResult), &bytesWritten, nullptr);
-        cerr << "Child: Empty array" << endl;
-        return;
-    }
-
     int maxElement = array[0];
-    for (size_t i = 1; i < array.size(); ++i) {
-        if (array[i] > maxElement) maxElement = array[i];
+    for (int i = 1; i < size; ++i) {
+        if (array[i] > maxElement) {
+            maxElement = array[i];
+        }
     }
 
     // Запись результата в stdout
-    DWORD bytesWritten;
-    if (!WriteFile(hStdOut.get(), &maxElement, sizeof(maxElement), &bytesWritten, nullptr)) {
-        cerr << "Child: Failed to write result" << endl;
-    }
+    SafeIO::writeExact(hStdOut.get(), &maxElement, sizeof(maxElement), "writing result");
 }
 
-// Функция для работы в режиме родителя с RAII
+// Функция для работы в режиме родителя
 void ParentMode() {
     // Создание каналов
     Pipe stdinPipe, stdoutPipe;
-
     SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
 
-    if (!stdinPipe.create(&sa, 0)) {
-        cerr << "Parent: Failed to create stdin pipe" << endl;
-        return;
-    }
-
-    if (!stdoutPipe.create(&sa, 0)) {
-        cerr << "Parent: Failed to create stdout pipe" << endl;
-        return;
-    }
+    stdinPipe.create(&sa, 0);
+    stdoutPipe.create(&sa, 0);
 
     // Подготовка структур для запуска процесса
     STARTUPINFOA si = { sizeof(STARTUPINFOA) };
@@ -210,66 +364,59 @@ void ParentMode() {
 
     // Получение пути к исполняемому файлу
     char selfPath[MAX_PATH];
-    GetModuleFileNameA(nullptr, selfPath, MAX_PATH);
+    CheckOperation(GetModuleFileNameA(nullptr, selfPath, MAX_PATH),
+        "GetModuleFileName", TRUE);
 
-    // Формирование командной строки с использованием char[]
-    char commandLine[MAX_PATH + 10];
-    strcpy_s(commandLine, selfPath);
-    strcat_s(commandLine, " child");
+    // Формирование командной строки
+    string commandLine = string(selfPath) + " child";
+    unique_ptr<char[]> cmdLineCopy = make_unique<char[]>(commandLine.size() + 1);
+    strcpy_s(cmdLineCopy.get(), commandLine.size() + 1, commandLine.c_str());
 
     // Запуск дочернего процесса
-    if (!childProcess.create(nullptr, commandLine, si)) {
-        cerr << "Parent: Failed to create process" << endl;
-        return;
-    }
+    childProcess.create(nullptr, cmdLineCopy.get(), si);
 
     // Закрываем ненужные дескрипторы в родительском процессе
-    stdinPipe.closeReadEnd();   // Закрываем read end stdin pipe (используется дочерним процессом)
-    stdoutPipe.closeWriteEnd(); // Закрываем write end stdout pipe (используется дочерним процессом)
+    stdinPipe.closeReadEnd();   // Закрываем read end stdin pipe
+    stdoutPipe.closeWriteEnd(); // Закрываем write end stdout pipe
 
-    // Ввод данных массива
-    int size;
-    cout << "Enter array size: ";
-    cin >> size;
+    try {
+        // Ввод размера массива
+        int size = SafeInputInt("Enter array size: ");
 
-    if (size <= 0) {
-        cerr << "Parent: Invalid array size" << endl;
-        return;
-    }
-
-    vector<int> array(size);
-    cout << "Enter " << size << " elements:\n";
-    for (int i = 0; i < size; ++i) {
-        cin >> array[i];
-    }
-
-    // Отправка данных в дочерний процесс
-    DWORD bytesWritten;
-    if (!WriteFile(stdinPipe.getWriteEnd().get(), &size, sizeof(size), &bytesWritten, nullptr)) {
-        cerr << "Parent: Failed to write size" << endl;
-    }
-
-    for (int i = 0; i < size; ++i) {
-        if (!WriteFile(stdinPipe.getWriteEnd().get(), &array[i], sizeof(array[i]), &bytesWritten, nullptr)) {
-            cerr << "Parent: Failed to write array element" << endl;
-            break;
+        if (size <= 0) {
+            throw invalid_argument("Array size must be greater than 0");
         }
-    }
 
-    // Закрываем дескриптор записи в stdin дочернего процесса
-    // Это сигнализирует конец данных
-    stdinPipe.closeWriteEnd();
+        // Ввод элементов с проверкой
+        vector<int> array = InputArrayWithValidation(size);
 
-    // Чтение результата из дочернего процесса
-    int result;
-    DWORD bytesRead;
+        // Отправка данных в дочерний процесс
+        SafeIO::writeExact(stdinPipe.getWriteEnd().get(), &size, sizeof(size), "writing array size");
 
-    // Ждем данные с таймаутом (5000 мс)
-    DWORD waitResult = childProcess.wait(5000);
-    if (waitResult == WAIT_OBJECT_0) {
-        // Процесс завершился, пробуем прочитать если что-то осталось в буфере
-        if (ReadFile(stdoutPipe.getReadEnd().get(), &result, sizeof(result), &bytesRead, nullptr) &&
-            bytesRead == sizeof(result)) {
+        for (int i = 0; i < size; ++i) {
+            SafeIO::writeExact(stdinPipe.getWriteEnd().get(), &array[i], sizeof(array[i]),
+                "writing array element " + to_string(i));
+        }
+
+        // Закрываем дескриптор записи в stdin дочернего процесса
+        stdinPipe.closeWriteEnd();
+
+        // Чтение результата из дочернего процесса
+        int result;
+        const DWORD timeoutMs = 5000;
+
+        DWORD waitResult = childProcess.wait(timeoutMs);
+        if (waitResult == WAIT_OBJECT_0) {
+            // Процесс завершился
+            DWORD exitCode = childProcess.getExitCode();
+
+            if (exitCode != 0) {
+                throw runtime_error("Child process failed with exit code: " + to_string(exitCode));
+            }
+
+            // Читаем результат
+            SafeIO::readExact(stdoutPipe.getReadEnd().get(), &result, sizeof(result), "reading result");
+
             if (result == -1) {
                 cout << "Child reported: Empty array" << endl;
             }
@@ -277,34 +424,49 @@ void ParentMode() {
                 cout << "Max element: " << result << endl;
             }
         }
+        else if (waitResult == WAIT_TIMEOUT) {
+            childProcess.terminate();
+            throw runtime_error("Child process timeout after " + to_string(timeoutMs) + " ms");
+        }
         else {
-            // Пробуем получить код возврата
-            DWORD exitCode;
-            if (childProcess.getExitCode(exitCode)) {
-                cerr << "Parent: Child process exited with code " << exitCode << ", but no result received" << endl;
-            }
-            else {
-                cerr << "Parent: Failed to read result and get exit code" << endl;
-            }
+            childProcess.terminate();
+            throw runtime_error("Unexpected wait result: " + to_string(waitResult));
         }
     }
-    else if (waitResult == WAIT_TIMEOUT) {
-        // Таймаут - процесс завис
-        cerr << "Parent: Child process timeout" << endl;
-        childProcess.terminate(1);
-    }
-    else {
-        // Ошибка ожидания
-        cerr << "Parent: Wait for child process failed" << endl;
+    catch (const exception& e) {
+        childProcess.terminate();
+        throw;
     }
 }
 
 int main(int argc, char* argv[]) {
-    if (argc > 1 && strcmp(argv[1], "child") == 0) {
-        ChildMode();
+    try {
+        if (argc > 1 && strcmp(argv[1], "child") == 0) {
+            ChildMode();
+        }
+        else {
+            ParentMode();
+        }
+        return 0;
     }
-    else {
-        ParentMode();
+    catch (const ProcessException& e) {
+        cerr << "Process error: " << e.what() << endl;
+        return static_cast<int>(e.getErrorCode());
     }
-    return 0;
+    catch (const invalid_argument& e) {
+        cerr << "Input error: " << e.what() << endl;
+        return 1;
+    }
+    catch (const runtime_error& e) {
+        cerr << "Runtime error: " << e.what() << endl;
+        return 1;
+    }
+    catch (const exception& e) {
+        cerr << "Unexpected exception: " << e.what() << endl;
+        return 1;
+    }
+    catch (...) {
+        cerr << "Unknown exception occurred" << endl;
+        return 1;
+    }
 }
