@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <limits>
+#include <cstring>
 
 using namespace std;
 
@@ -32,7 +33,6 @@ private:
         string message;
         if (size > 0 && messageBuffer) {
             message = string(messageBuffer, size);
-            // Убираем символы новой строки в конце
             while (!message.empty() && (message.back() == '\r' || message.back() == '\n')) {
                 message.pop_back();
             }
@@ -45,14 +45,13 @@ private:
     }
 };
 
-// Вспомогательная функция для проверки операций
+// Вспомогательные функции для проверки операций
 void CheckPipeOperation(bool success, const string& operationName) {
     if (!success) {
         throw ProcessException(operationName, GetLastError());
     }
 }
 
-// Шаблонная функция для проверки любых операций
 template<typename T>
 void CheckOperation(bool success, const string& operationName, T errorCode) {
     if (!success) {
@@ -60,7 +59,6 @@ void CheckOperation(bool success, const string& operationName, T errorCode) {
     }
 }
 
-// Специализация для BOOL операций Windows
 template<>
 void CheckOperation(bool success, const string& operationName, BOOL) {
     if (!success) {
@@ -79,11 +77,9 @@ public:
         }
     }
 
-    // Запрещаем копирование
     HandleGuard(const HandleGuard&) = delete;
     HandleGuard& operator=(const HandleGuard&) = delete;
 
-    // Разрешаем перемещение
     HandleGuard(HandleGuard&& other) noexcept : handle_(other.handle_) {
         other.handle_ = nullptr;
     }
@@ -142,7 +138,7 @@ private:
     HandleGuard writeEnd_;
 };
 
-// Функции для безопасного чтения/записи данных с исключениями
+// Общие функции для безопасного ввода/вывода
 namespace SafeIO {
     void readExact(HANDLE handle, void* buffer, DWORD size, const string& context) {
         BYTE* bytes = static_cast<BYTE*>(buffer);
@@ -172,6 +168,46 @@ namespace SafeIO {
             totalWritten += bytesWritten;
         }
     }
+
+    // Общие функции для работы с массивами
+    void writeArray(HANDLE handle, const vector<int>& array, const string& context) {
+        for (size_t i = 0; i < array.size(); ++i) {
+            writeExact(handle, &array[i], sizeof(array[i]),
+                context + " - writing array element " + to_string(i));
+        }
+    }
+
+    vector<int> readArray(HANDLE handle, int size, const string& context) {
+        vector<int> array(size);
+        for (int i = 0; i < size; ++i) {
+            readExact(handle, &array[i], sizeof(array[i]),
+                context + " - reading array element " + to_string(i));
+        }
+        return array;
+    }
+
+    void writeSizeAndArray(HANDLE handle, int size, const vector<int>& array, const string& context) {
+        writeExact(handle, &size, sizeof(size), context + " - writing array size");
+        if (size > 0) {
+            writeArray(handle, array, context);
+        }
+    }
+
+    pair<int, vector<int>> readSizeAndArray(HANDLE handle, const string& context) {
+        int size;
+        readExact(handle, &size, sizeof(size), context + " - reading array size");
+
+        if (size < 0) {
+            throw invalid_argument("Invalid array size: " + to_string(size));
+        }
+
+        vector<int> array;
+        if (size > 0) {
+            array = readArray(handle, size, context);
+        }
+
+        return make_pair(size, array);
+    }
 }
 
 // RAII-обертка для процесса
@@ -181,18 +217,15 @@ public:
 
     ~Process() = default;
 
-    // Запрещаем копирование
     Process(const Process&) = delete;
     Process& operator=(const Process&) = delete;
 
-    // Разрешаем перемещение
     Process(Process&&) = default;
     Process& operator=(Process&&) = default;
 
     void create(LPCSTR application, LPSTR commandLine, STARTUPINFOA& si) {
         PROCESS_INFORMATION pi = {};
 
-        // Создаем копию командной строки, так как CreateProcess может модифицировать ее
         unique_ptr<char[]> cmdLineCopy;
         if (commandLine) {
             size_t len = strlen(commandLine) + 1;
@@ -216,6 +249,7 @@ public:
     }
 
     HANDLE getProcessHandle() const { return process_.get(); }
+
     bool isRunning() const {
         if (!process_.isValid()) return false;
 
@@ -251,53 +285,84 @@ private:
     HandleGuard thread_;
 };
 
-// Функция для очистки буфера ввода
-void ClearInputBuffer() {
-    cin.clear();
-    cin.ignore(numeric_limits<streamsize>::max(), '\n');
+// Общие функции для работы с вводом
+namespace InputUtils {
+    void ClearInputBuffer() {
+        cin.clear();
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+    }
+
+    int SafeInputInt(const string& prompt) {
+        int value;
+        while (true) {
+            cout << prompt;
+            if (!(cin >> value)) {
+                cout << "Invalid input. Please enter a valid integer.\n";
+                ClearInputBuffer();
+            }
+            else {
+                ClearInputBuffer();
+                break;
+            }
+        }
+        return value;
+    }
+
+    vector<int> InputArrayWithValidation(int size) {
+        vector<int> array;
+        array.reserve(size);
+
+        cout << "Enter " << size << " elements:\n";
+
+        for (int i = 0; i < size; ++i) {
+            string prompt = "Element " + to_string(i + 1) + ": ";
+            int element = SafeInputInt(prompt);
+            array.push_back(element);
+        }
+
+        cout << "Checking for extra input... ";
+        string extra;
+        if (getline(cin, extra)) {
+            if (!extra.empty()) {
+                throw runtime_error("Too many elements provided. Expected " +
+                    to_string(size) + " elements.");
+            }
+        }
+
+        return array;
+    }
+
+    pair<int, vector<int>> GetArrayFromUser() {
+        int size = SafeInputInt("Enter array size: ");
+        if (size <= 0) {
+            throw invalid_argument("Array size must be greater than 0");
+        }
+        vector<int> array = InputArrayWithValidation(size);
+        return make_pair(size, array);
+    }
 }
 
-// Функция для безопасного ввода числа
-int SafeInputInt(const string& prompt) {
-    int value;
-    while (true) {
-        cout << prompt;
-        if (!(cin >> value)) {
-            cout << "Invalid input. Please enter a valid integer.\n";
-            ClearInputBuffer();
-        }
-        else {
-            ClearInputBuffer();
-            break;
-        }
-    }
-    return value;
-}
-
-// Функция для ввода массива с проверкой лишних элементов
-vector<int> InputArrayWithValidation(int size) {
-    vector<int> array;
-    array.reserve(size);
-
-    cout << "Enter " << size << " elements:\n";
-
-    for (int i = 0; i < size; ++i) {
-        string prompt = "Element " + to_string(i + 1) + ": ";
-        int element = SafeInputInt(prompt);
-        array.push_back(element);
+// Общие функции для работы с процессами
+namespace ProcessUtils {
+    unique_ptr<char[]> PrepareCommandLine(const string& commandLine) {
+        unique_ptr<char[]> cmdLineCopy = make_unique<char[]>(commandLine.size() + 1);
+        strcpy_s(cmdLineCopy.get(), commandLine.size() + 1, commandLine.c_str());
+        return cmdLineCopy;
     }
 
-    // Проверка на лишние элементы
-    cout << "Checking for extra input... ";
-    string extra;
-    if (getline(cin, extra)) {
-        if (!extra.empty()) {
-            throw runtime_error("Too many elements provided. Expected " +
-                to_string(size) + " elements.");
-        }
+    string GetSelfPath() {
+        char selfPath[MAX_PATH];
+        CheckOperation(GetModuleFileNameA(nullptr, selfPath, MAX_PATH),
+            "GetModuleFileName", TRUE);
+        return string(selfPath);
     }
 
-    return array;
+    Process CreateChildProcess(const string& commandLine, STARTUPINFOA& si) {
+        Process childProcess;
+        auto cmdLineCopy = PrepareCommandLine(commandLine);
+        childProcess.create(nullptr, cmdLineCopy.get(), si);
+        return childProcess;
+    }
 }
 
 // Функция для работы в режиме потомка
@@ -309,112 +374,64 @@ void ChildMode() {
         throw runtime_error("Invalid standard handles in child process");
     }
 
-    // Чтение размера массива из stdin
-    int size;
-    SafeIO::readExact(hStdIn.get(), &size, sizeof(size), "reading array size");
-
-    // Проверка корректности размера
-    if (size < 0) {
-        throw invalid_argument("Invalid array size: " + to_string(size));
-    }
+    auto data = SafeIO::readSizeAndArray(hStdIn.get(), "child process");
+    int size = data.first;
+    vector<int> array = data.second;
 
     if (size == 0) {
-        // Пустой массив - отправляем специальное значение
         int result = -1;
         SafeIO::writeExact(hStdOut.get(), &result, sizeof(result), "writing empty array result");
         return;
     }
 
-    // Чтение элементов массива
-    vector<int> array(size);
-    for (int i = 0; i < size; ++i) {
-        SafeIO::readExact(hStdIn.get(), &array[i], sizeof(array[i]),
-            "reading array element " + to_string(i));
-    }
-
-    // Поиск максимального элемента
     int maxElement = array[0];
-    for (int i = 1; i < size; ++i) {
+    for (size_t i = 1; i < array.size(); ++i) {
         if (array[i] > maxElement) {
             maxElement = array[i];
         }
     }
 
-    // Запись результата в stdout
     SafeIO::writeExact(hStdOut.get(), &maxElement, sizeof(maxElement), "writing result");
 }
 
 // Функция для работы в режиме родителя
 void ParentMode() {
-    // Создание каналов
     Pipe stdinPipe, stdoutPipe;
     SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
 
     stdinPipe.create(&sa, 0);
     stdoutPipe.create(&sa, 0);
 
-    // Подготовка структур для запуска процесса
     STARTUPINFOA si = { sizeof(STARTUPINFOA) };
-    Process childProcess;
-
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput = stdinPipe.getReadEnd().get();
     si.hStdOutput = stdoutPipe.getWriteEnd().get();
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
 
-    // Получение пути к исполняемому файлу
-    char selfPath[MAX_PATH];
-    CheckOperation(GetModuleFileNameA(nullptr, selfPath, MAX_PATH),
-        "GetModuleFileName", TRUE);
+    string selfPath = ProcessUtils::GetSelfPath();
+    Process childProcess = ProcessUtils::CreateChildProcess(selfPath + " child", si);
 
-    // Формирование командной строки
-    string commandLine = string(selfPath) + " child";
-    unique_ptr<char[]> cmdLineCopy = make_unique<char[]>(commandLine.size() + 1);
-    strcpy_s(cmdLineCopy.get(), commandLine.size() + 1, commandLine.c_str());
-
-    // Запуск дочернего процесса
-    childProcess.create(nullptr, cmdLineCopy.get(), si);
-
-    // Закрываем ненужные дескрипторы в родительском процессе
-    stdinPipe.closeReadEnd();   // Закрываем read end stdin pipe
-    stdoutPipe.closeWriteEnd(); // Закрываем write end stdout pipe
+    stdinPipe.closeReadEnd();
+    stdoutPipe.closeWriteEnd();
 
     try {
-        // Ввод размера массива
-        int size = SafeInputInt("Enter array size: ");
+        auto data = InputUtils::GetArrayFromUser();
+        int size = data.first;
+        vector<int> array = data.second;
 
-        if (size <= 0) {
-            throw invalid_argument("Array size must be greater than 0");
-        }
-
-        // Ввод элементов с проверкой
-        vector<int> array = InputArrayWithValidation(size);
-
-        // Отправка данных в дочерний процесс
-        SafeIO::writeExact(stdinPipe.getWriteEnd().get(), &size, sizeof(size), "writing array size");
-
-        for (int i = 0; i < size; ++i) {
-            SafeIO::writeExact(stdinPipe.getWriteEnd().get(), &array[i], sizeof(array[i]),
-                "writing array element " + to_string(i));
-        }
-
-        // Закрываем дескриптор записи в stdin дочернего процесса
+        SafeIO::writeSizeAndArray(stdinPipe.getWriteEnd().get(), size, array, "parent process");
         stdinPipe.closeWriteEnd();
 
-        // Чтение результата из дочернего процесса
         int result;
         const DWORD timeoutMs = 5000;
 
         DWORD waitResult = childProcess.wait(timeoutMs);
         if (waitResult == WAIT_OBJECT_0) {
-            // Процесс завершился
             DWORD exitCode = childProcess.getExitCode();
-
             if (exitCode != 0) {
                 throw runtime_error("Child process failed with exit code: " + to_string(exitCode));
             }
 
-            // Читаем результат
             SafeIO::readExact(stdoutPipe.getReadEnd().get(), &result, sizeof(result), "reading result");
 
             if (result == -1) {
