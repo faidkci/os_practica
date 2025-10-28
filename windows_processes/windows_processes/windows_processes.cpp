@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <limits>
 #include <cstring>
+#include <algorithm>
 
 // Используем все необходимые компоненты из std
 using std::vector;
@@ -29,7 +30,30 @@ using std::streamsize;
 using std::to_string;
 using std::strlen;
 using std::strcmp;
-using std::strcpy_s;
+
+// Выделение констант и конфигурации
+namespace Config {
+    constexpr DWORD CHILD_TIMEOUT_MS = 5000;
+    constexpr int INVALID_RESULT = -1;
+    constexpr DWORD BUFFER_SIZE = 4096;
+    constexpr int MAX_ARRAY_SIZE = 1000;
+    constexpr int MIN_ARRAY_SIZE = 1;
+}
+
+// Упрощение обработки ошибок - макрос для проверки операций
+#define CHECK_OPERATION(operation, context) \
+    do { \
+        if (!(operation)) { \
+            throw ProcessException((context), GetLastError()); \
+        } \
+    } while(0)
+
+#define CHECK_PIPE_OPERATION(operation, context) \
+    do { \
+        if (!(operation)) { \
+            throw ProcessException((context), GetLastError()); \
+        } \
+    } while(0)
 
 // Исключение для ошибок процессов
 class ProcessException : public runtime_error {
@@ -65,7 +89,7 @@ private:
     }
 };
 
-// Вспомогательные функции для проверки операций
+// Вспомогательные функции для проверки операций - оставляем для обратной совместимости
 void CheckPipeOperation(bool success, const string& operationName) {
     if (!success) {
         throw ProcessException(operationName, GetLastError());
@@ -142,7 +166,7 @@ public:
 
     void create(SECURITY_ATTRIBUTES* sa = nullptr, DWORD size = 0) {
         HANDLE readEnd, writeEnd;
-        CheckPipeOperation(CreatePipe(&readEnd, &writeEnd, sa, size), "CreatePipe");
+        CHECK_PIPE_OPERATION(CreatePipe(&readEnd, &writeEnd, sa, size), "CreatePipe");
         readEnd_.reset(readEnd);
         writeEnd_.reset(writeEnd);
     }
@@ -158,7 +182,7 @@ private:
     HandleGuard writeEnd_;
 };
 
-// Общие функции для безопасного ввода/вывода
+// Упрощение SafeIO функций с шаблонными методами
 namespace SafeIO {
     void readExact(HANDLE handle, void* buffer, DWORD size, const string& context) {
         BYTE* bytes = static_cast<BYTE*>(buffer);
@@ -166,8 +190,8 @@ namespace SafeIO {
 
         while (totalRead < size) {
             DWORD bytesRead = 0;
-            CheckOperation(ReadFile(handle, bytes + totalRead, size - totalRead, &bytesRead, nullptr),
-                context + " - ReadFile", TRUE);
+            CHECK_OPERATION(ReadFile(handle, bytes + totalRead, size - totalRead, &bytesRead, nullptr),
+                context + " - ReadFile");
 
             if (bytesRead == 0) {
                 throw runtime_error(context + " - Unexpected end of file");
@@ -183,39 +207,49 @@ namespace SafeIO {
 
         while (totalWritten < size) {
             DWORD bytesWritten = 0;
-            CheckOperation(WriteFile(handle, bytes + totalWritten, size - totalWritten, &bytesWritten, nullptr),
-                context + " - WriteFile", TRUE);
+            CHECK_OPERATION(WriteFile(handle, bytes + totalWritten, size - totalWritten, &bytesWritten, nullptr),
+                context + " - WriteFile");
             totalWritten += bytesWritten;
         }
     }
 
-    // Общие функции для работы с массивами
+    // Шаблонные функции для типизированного ввода/вывода
+    template<typename T>
+    void writeValue(HANDLE handle, const T& value, const string& context) {
+        writeExact(handle, &value, sizeof(value), context);
+    }
+
+    template<typename T>
+    T readValue(HANDLE handle, const string& context) {
+        T value;
+        readExact(handle, &value, sizeof(value), context);
+        return value;
+    }
+
+    // Общие функции для работы с массивами - сохраняем оригинальные интерфейсы
     void writeArray(HANDLE handle, const vector<int>& array, const string& context) {
         for (size_t i = 0; i < array.size(); ++i) {
-            writeExact(handle, &array[i], sizeof(array[i]),
-                context + " - writing array element " + to_string(i));
+            writeValue<int>(handle, array[i], context + " - writing array element " + to_string(i));
         }
     }
 
     vector<int> readArray(HANDLE handle, int size, const string& context) {
         vector<int> array(size);
         for (int i = 0; i < size; ++i) {
-            readExact(handle, &array[i], sizeof(array[i]),
-                context + " - reading array element " + to_string(i));
+            array[i] = readValue<int>(handle, context + " - reading array element " + to_string(i));
         }
         return array;
     }
 
     void writeSizeAndArray(HANDLE handle, int size, const vector<int>& array, const string& context) {
-        writeExact(handle, &size, sizeof(size), context + " - writing array size");
+        writeValue<int>(handle, size, context + " - writing array size");
         if (size > 0) {
             writeArray(handle, array, context);
         }
     }
 
     pair<int, vector<int>> readSizeAndArray(HANDLE handle, const string& context) {
-        int size;
-        readExact(handle, &size, sizeof(size), context + " - reading array size");
+        int size = readValue<int>(handle, context + " - reading array size");
 
         if (size < 0) {
             throw invalid_argument("Invalid array size: " + to_string(size));
@@ -253,7 +287,7 @@ public:
             strcpy_s(cmdLineCopy.get(), len, commandLine);
         }
 
-        CheckOperation(CreateProcessA(
+        CHECK_OPERATION(CreateProcessA(
             application,
             cmdLineCopy ? cmdLineCopy.get() : nullptr,
             nullptr, nullptr,
@@ -262,7 +296,7 @@ public:
             nullptr, nullptr,
             &si,
             &pi
-        ), "CreateProcess", TRUE);
+        ), "CreateProcess");
 
         process_.reset(pi.hProcess);
         thread_.reset(pi.hThread);
@@ -290,13 +324,13 @@ public:
 
     DWORD getExitCode() const {
         DWORD exitCode;
-        CheckOperation(GetExitCodeProcess(process_.get(), &exitCode), "GetExitCodeProcess", TRUE);
+        CHECK_OPERATION(GetExitCodeProcess(process_.get(), &exitCode), "GetExitCodeProcess");
         return exitCode;
     }
 
     void terminate(UINT exitCode = 1) {
         if (isRunning()) {
-            CheckOperation(TerminateProcess(process_.get(), exitCode), "TerminateProcess", TRUE);
+            CHECK_OPERATION(TerminateProcess(process_.get(), exitCode), "TerminateProcess");
         }
     }
 
@@ -329,6 +363,11 @@ namespace InputUtils {
     }
 
     vector<int> InputArrayWithValidation(int size) {
+        if (size > Config::MAX_ARRAY_SIZE) {
+            throw invalid_argument("Array size too large. Maximum allowed: " +
+                to_string(Config::MAX_ARRAY_SIZE));
+        }
+
         vector<int> array;
         array.reserve(size);
 
@@ -354,7 +393,7 @@ namespace InputUtils {
 
     pair<int, vector<int>> GetArrayFromUser() {
         int size = SafeInputInt("Enter array size: ");
-        if (size <= 0) {
+        if (size < Config::MIN_ARRAY_SIZE) {
             throw invalid_argument("Array size must be greater than 0");
         }
         vector<int> array = InputArrayWithValidation(size);
@@ -372,8 +411,7 @@ namespace ProcessUtils {
 
     string GetSelfPath() {
         char selfPath[MAX_PATH];
-        CheckOperation(GetModuleFileNameA(nullptr, selfPath, MAX_PATH),
-            "GetModuleFileName", TRUE);
+        CHECK_OPERATION(GetModuleFileNameA(nullptr, selfPath, MAX_PATH), "GetModuleFileName");
         return string(selfPath);
     }
 
@@ -399,19 +437,14 @@ void ChildMode() {
     vector<int> array = data.second;
 
     if (size == 0) {
-        int result = -1;
-        SafeIO::writeExact(hStdOut.get(), &result, sizeof(result), "writing empty array result");
+        int result = Config::INVALID_RESULT;
+        SafeIO::writeValue(hStdOut.get(), result, "writing empty array result");
         return;
     }
 
-    int maxElement = array[0];
-    for (size_t i = 1; i < array.size(); ++i) {
-        if (array[i] > maxElement) {
-            maxElement = array[i];
-        }
-    }
-
-    SafeIO::writeExact(hStdOut.get(), &maxElement, sizeof(maxElement), "writing result");
+    // Используем стандартный алгоритм для поиска максимума
+    int maxElement = *std::max_element(array.begin(), array.end());
+    SafeIO::writeValue(hStdOut.get(), maxElement, "writing result");
 }
 
 // Функция для работы в режиме родителя
@@ -443,7 +476,7 @@ void ParentMode() {
         stdinPipe.closeWriteEnd();
 
         int result;
-        const DWORD timeoutMs = 5000;
+        const DWORD timeoutMs = Config::CHILD_TIMEOUT_MS;
 
         DWORD waitResult = childProcess.wait(timeoutMs);
         if (waitResult == WAIT_OBJECT_0) {
@@ -452,9 +485,9 @@ void ParentMode() {
                 throw runtime_error("Child process failed with exit code: " + to_string(exitCode));
             }
 
-            SafeIO::readExact(stdoutPipe.getReadEnd().get(), &result, sizeof(result), "reading result");
+            result = SafeIO::readValue<int>(stdoutPipe.getReadEnd().get(), "reading result");
 
-            if (result == -1) {
+            if (result == Config::INVALID_RESULT) {
                 cout << "Child reported: Empty array" << endl;
             }
             else {
