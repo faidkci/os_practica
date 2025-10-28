@@ -9,7 +9,27 @@
 #include <limits>
 #include <cstring>
 
-using namespace std;
+// Используем все необходимые компоненты из std
+using std::vector;
+using std::string;
+using std::unique_ptr;
+using std::make_unique;
+using std::runtime_error;
+using std::invalid_argument;
+using std::exception;
+using std::cout;
+using std::cin;
+using std::cerr;
+using std::endl;
+using std::pair;
+using std::make_pair;
+using std::getline;
+using std::numeric_limits;
+using std::streamsize;
+using std::to_string;
+using std::strlen;
+using std::strcmp;
+using std::strcpy_s;
 
 // Исключение для ошибок процессов
 class ProcessException : public runtime_error {
